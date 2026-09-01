@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  zigil as a static library, for consuming it from another solution.
+
+  Builds the same code as `zigil.vcxproj` without `src\main.cc` and without the
+  `static_assert` test translation units, so a consumer pays for neither. Add it
+  with a ProjectReference and put `include` on the include path:
+
+      <ProjectReference Include="third_party\zigil\zigil.lib.vcxproj">
+        <Project>{4CECF771-6A14-4C6E-ADAC-9B1F0359C7EE}</Project>
+      </ProjectReference>
+
+  Zydis is a hard dependency. Standalone this project resolves it through the
+  vcpkg manifest in the repository; inside another solution, add `zydis` to that
+  solution's `vcpkg.json` instead, and link `Zydis.lib` and `Zycore.lib`
+  explicitly if the consuming solution turns vcpkg's auto-link off.
+
+  The toolset defaults to whatever the SDK picked. Set `ZigilToolset` to match
+  the consuming solution when it differs, for instance
+  `-p:ZigilToolset=ClangCL`.
+-->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{4CECF771-6A14-4C6E-ADAC-9B1F0359C7EE}</ProjectGuid>
+    <RootNamespace>zigil</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <CharacterSet>Unicode</CharacterSet>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)'!='Debug'">false</UseDebugLibraries>
+    <!-- Cpp.Default.props leaves this at v100 when nobody sets it -->
+    <PlatformToolset Condition="'$(ZigilToolset)'!=''">$(ZigilToolset)</PlatformToolset>
+    <PlatformToolset Condition="'$(ZigilToolset)'==''">$(DefaultPlatformToolset)</PlatformToolset>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <!-- the project is named zigil.lib, so without this the output is zigil.lib.lib -->
+    <TargetName>zigil</TargetName>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <PropertyGroup Label="Vcpkg">
+    <VcpkgEnableManifest>true</VcpkgEnableManifest>
+    <VcpkgUseStatic>true</VcpkgUseStatic>
+  </PropertyGroup>
+
+  <!--
+    Defaults for a standalone build. These sit before the consuming solution's
+    property sheet on purpose, so anything that sheet defines wins over them.
+  -->
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <ConformanceMode>true</ConformanceMode>
+      <WarningLevel>Level4</WarningLevel>
+      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary Condition="'$(Configuration)'=='Debug'">MultiThreadedDebug</RuntimeLibrary>
+      <RuntimeLibrary Condition="'$(Configuration)'!='Debug'">MultiThreaded</RuntimeLibrary>
+      <Optimization Condition="'$(Configuration)'!='Debug'">MaxSpeed</Optimization>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <!-- picked up when built inside a solution that has one, ignored otherwise -->
+  <Import Project="$(SolutionDir)props\common.props"
+          Condition="Exists('$(SolutionDir)props\common.props')" />
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="src\zigil\scanner.cc" />
+    <ClCompile Include="src\zigil\analyzer\pe_analyzer.cc" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="include\zigil\analyzer\pe_analyzer.hh" />
+    <ClInclude Include="include\zigil\detail\fixed_string.hh" />
+    <ClInclude Include="include\zigil\detail\hash.hh" />
+    <ClInclude Include="include\zigil\lexer.hh" />
+    <ClInclude Include="include\zigil\parser.hh" />
+    <ClInclude Include="include\zigil\pattern.hh" />
+    <ClInclude Include="include\zigil\scanner.hh" />
+    <ClInclude Include="include\zigil\tables.hh" />
+    <ClInclude Include="include\zigil\zigil.hh" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+</Project>

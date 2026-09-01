@@ -1,0 +1,218 @@
+#ifndef ZIGIL_SCANNER_HH_
+#define ZIGIL_SCANNER_HH_
+
+#include "zigil/pattern.hh"
+#include "zigil/analyzer/pe_analyzer.hh"
+#include "zigil/detail/fixed_string.hh"
+#include "zigil/detail/hash.hh"
+
+#include <optional>
+#include <type_traits>
+#include <vector>
+
+namespace zigil {
+	enum class CaptureKind : uint8_t {
+		kNone,
+		kRegister,
+		kImmediate,
+		/* a resolved rip-relative or branch target, always stored as an RVA */
+		kAddress,
+		kMemory
+	};
+	struct Capture {
+		CaptureKind kind = CaptureKind::kNone;
+		ZydisRegister reg = ZYDIS_REGISTER_NONE;
+		int64_t value = 0;
+		/* encoded width of the value in bits, 0 when it does not apply */
+		uint8_t width = 0;
+		/*
+		* Set on a pre-bound value seeded as a plain number: it then satisfies an
+		* immediate as well as a resolved address, because the caller cannot know
+		* which of the two the instruction will produce.
+		*/
+		bool numeric_any = false;
+
+		// only filled for CaptureKind::kMemory
+		ZydisRegister mem_segment = ZYDIS_REGISTER_NONE;
+		ZydisRegister mem_base = ZYDIS_REGISTER_NONE;
+		ZydisRegister mem_index = ZYDIS_REGISTER_NONE;
+		uint8_t mem_scale = 0;
+	};
+	/*
+	* One match, plus whatever the pattern captured. Addresses are RVAs; GetVA
+	* adds the image base, which is the only place the image base enters.
+	*/
+	class MatchResult {
+	public:
+		uint64_t Rva() const { return rva_; }
+		uint64_t Va() const { return image_base_ + rva_; }
+		/* RVA of the instruction that follows the last one the pattern matched */
+		uint64_t NextRva() const { return next_rva_; }
+		size_t CaptureCount() const { return captures_.size(); }
+		const Capture* CaptureAt(size_t index) const {
+			return index < captures_.size() ? &captures_[index] : nullptr;
+		}
+
+		template<typename T>
+		T Get(std::string_view name) const {
+			return Cast<T>(FindCapture(detail::Fnv1a(name)));
+		}
+		template<typename T, detail::FixedString Name>
+		T Get() const {
+			constexpr uint64_t hash = detail::Fnv1a(Name.View());
+			return Cast<T>(FindCapture(hash));
+		}
+		template<typename T>
+		T GetVA(std::string_view name) const {
+			return CastVA<T>(FindCapture(detail::Fnv1a(name)));
+		}
+		template<typename T, detail::FixedString Name>
+		T GetVA() const {
+			constexpr uint64_t hash = detail::Fnv1a(Name.View());
+			return CastVA<T>(FindCapture(hash));
+		}
+		bool Has(std::string_view name) const {
+			return FindCapture(detail::Fnv1a(name)) != nullptr;
+		}
+
+		void Print() const;
+
+	private:
+		friend class Scanner;
+
+		const Capture* FindCapture(uint64_t hash) const {
+			for (size_t i = 0; i < hashes_.size() && i < captures_.size(); i++) {
+				if (hashes_[i] == hash) {
+					return captures_[i].kind == CaptureKind::kNone ? nullptr : &captures_[i];
+				}
+			}
+			return nullptr;
+		}
+		template<typename T>
+		T Cast(const Capture* capture) const {
+			if (!capture) {
+				return T{};
+			}
+			if constexpr (std::is_same_v<std::remove_cv_t<T>, ZydisRegister>) {
+				return capture->reg;
+			}
+			else if constexpr (std::is_enum_v<T>) {
+				return (T)(std::underlying_type_t<T>)capture->value;
+			}
+			else {
+				return (T)capture->value;
+			}
+		}
+		template<typename T>
+		T CastVA(const Capture* capture) const {
+			if (!capture) {
+				return T{};
+			}
+			return (T)(image_base_ + (uint64_t)capture->value);
+		}
+
+	private:
+		uint64_t rva_ = 0;
+		uint64_t next_rva_ = 0;
+		uint64_t image_base_ = 0;
+		std::vector<Capture> captures_;
+		std::vector<uint64_t> hashes_;
+	};
+	/*
+	* Matches patterns against the instruction index the analyzer produced. The
+	* scan iterates that bitmap in ascending RVA and re-decodes on demand, so
+	* "the next instruction" always means the next instruction the analyzer
+	* decoded, in address order - it does not stop at ret, padding or function
+	* boundaries.
+	*/
+	class Scanner {
+	public:
+		explicit Scanner(const analyzer::PEAnalyzer& analyzer);
+
+		/* first match at or after start_rva */
+		std::optional<MatchResult> Find(PatternView pattern, uint64_t start_rva = 0) const;
+		/* every match; limit == 0 means no limit */
+		std::vector<MatchResult> FindAll(PatternView pattern, size_t limit = 0) const;
+
+		/*
+		* Pre-bound variables. A variable seeded here is enforced instead of
+		* captured when the pattern first reaches it, which is what turns a
+		* pattern into an xref search:
+		*
+		*   scanner.SetAddress("target", global_rva);
+		*   scanner.FindAll(R"(mov $reg:r64, [rip+$target:imm])"_sig.View());
+		*
+		* Because a resolved address depends on where the instruction sits, this
+		* is the one case where matching is position dependent.
+		*
+		* A type suffix on a pre-bound variable acts as an assertion: seeding a
+		* register into `$x:imm` (or the other way round) is reported and the scan
+		* returns nothing rather than silently never matching.
+		*/
+		void Set(std::string_view name, ZydisRegister reg);
+		/* an RVA, not a VA - subtract the image base first */
+		void SetAddress(std::string_view name, uint64_t rva);
+		void SetImmediate(std::string_view name, int64_t value, uint8_t width = 0);
+		/* matches an immediate or a resolved address with this value */
+		void Set(std::string_view name, uint64_t value);
+		void Unset(std::string_view name);
+		void UnsetAll() { prebound_.clear(); }
+		size_t PreboundCount() const { return prebound_.size(); }
+
+		/*
+		* How many instructions an open ended gap (<?>, <N+>) may skip. Without a
+		* bound a failed match would walk to the end of the section every time.
+		*/
+		void SetSkipLimit(uint32_t limit) { skip_limit_ = limit; }
+		uint32_t SkipLimit() const { return skip_limit_; }
+
+	private:
+		struct PreBound {
+			uint64_t hash;
+			Capture capture;
+		};
+
+		void SetCapture(std::string_view name, const Capture& capture);
+		/* captures vector with every pre-bound variable of this pattern filled in */
+		std::vector<Capture> SeedCaptures(PatternView pattern) const;
+		const Capture* PreboundFor(PatternView pattern, uint8_t var_idx) const;
+		/* reports type conflicts between the pre-bound values and the pattern */
+		bool ValidatePrebound(PatternView pattern) const;
+
+		/* one pass over the instruction index; limit == 0 collects everything */
+		void Collect(PatternView pattern, uint64_t start_rva, size_t limit,
+			std::vector<MatchResult>& out) const;
+		bool Decode(uint64_t rva, ZydisDecodedInstruction& inst) const;
+		bool DecodeFull(uint64_t rva, ZydisDecodedInstruction& inst,
+			ZydisDecodedOperand* operands) const;
+		/* first instruction start at or after rva + length, 0 when there is none */
+		uint64_t NextStart(uint64_t rva, uint8_t length) const;
+
+		bool MatchAt(PatternView pattern, uint64_t rva,
+			const std::vector<Capture>& seed, MatchResult& out) const;
+		bool MatchFrom(PatternView pattern, size_t index, uint64_t rva,
+			std::vector<Capture>& captures, uint64_t& next_rva) const;
+		bool MatchInstructionAt(const MatchInstruction& pattern, uint64_t rva,
+			std::vector<Capture>& captures, uint8_t& length) const;
+		bool MatchOperand(const Operand& pattern, const ZydisDecodedInstruction& inst,
+			const ZydisDecodedOperand& op, uint8_t imm_slot, uint64_t rva,
+			std::vector<Capture>& captures) const;
+		bool MatchMemory(const MemOperand& pattern, const ZydisDecodedInstruction& inst,
+			const ZydisDecodedOperand& op, uint64_t rva, std::vector<Capture>& captures) const;
+		Capture CaptureFromOperand(const ZydisDecodedInstruction& inst,
+			const ZydisDecodedOperand& op, uint8_t imm_slot, uint64_t rva) const;
+		bool BindOrCheck(uint8_t var_idx, const Capture& value, RegWidth width,
+			std::vector<Capture>& captures) const;
+
+	private:
+		const analyzer::PEAnalyzer* analyzer_ = nullptr;
+		const uint8_t* image_ = nullptr;
+		size_t size_ = 0;
+		const std::vector<bool>* starts_ = nullptr;
+		ZydisDecoder decoder_{};
+		uint32_t skip_limit_ = 256;
+		std::vector<PreBound> prebound_;
+	};
+} // namespace zigil
+
+#endif // ZIGIL_SCANNER_HH_

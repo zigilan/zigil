@@ -1,0 +1,699 @@
+#include "zigil/scanner.hh"
+
+#include <algorithm>
+#include <variant>
+
+namespace zigil {
+	namespace {
+		// the parser resolves register names through tables.hh, and [rip+...] only
+		// works if that table agrees with the enum the decoder reports
+		static_assert(tables::FindRegister("rip") == ZYDIS_REGISTER_RIP,
+			"register table is out of sync with the Zydis enum");
+
+		constexpr uint8_t kNoVariable = 0xFF;
+		/* an x86-64 instruction is never longer than this */
+		constexpr size_t kMaxInstructionLength = 16;
+
+		constexpr uint64_t WidthMask(uint8_t bits) {
+			return (bits == 0 || bits >= 64) ? ~0ull : (1ull << bits) - 1;
+		}
+		/*
+		* Immediates and displacements are compared as bit patterns truncated to the
+		* width the instruction actually encodes them with, so `-1` and `0xFFFFFFFF`
+		* both match an imm32 of 0xFFFFFFFF.
+		*/
+		bool ValueEquals(int64_t a, int64_t b, uint8_t bits) {
+			const uint64_t mask = WidthMask(bits);
+			return ((uint64_t)a & mask) == ((uint64_t)b & mask);
+		}
+		/*
+		* Two captures are compared at the narrower of the two widths, and an
+		* unset width means "the full 64 bits". Written out because the ternaries
+		* promote their uint8_t operands to int, so the result has to be narrowed
+		* back deliberately rather than by an implicit conversion at the call.
+		*/
+		uint8_t CommonWidth(uint8_t a, uint8_t b) {
+			return (uint8_t)std::min(a ? a : 64, b ? b : 64);
+		}
+		bool SameEnclosingRegister(ZydisRegister a, ZydisRegister b) {
+			if (a == ZYDIS_REGISTER_NONE || b == ZYDIS_REGISTER_NONE) {
+				return false;
+			}
+			return ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, a) ==
+				ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, b);
+		}
+		bool RegMatchesWidth(ZydisRegister reg, RegWidth width) {
+			if (width == RegWidth::kNone || width == RegWidth::kAny) {
+				return true;
+			}
+			const ZydisRegisterClass reg_class = ZydisRegisterGetClass(reg);
+			switch (width) {
+			case RegWidth::k8:   return reg_class == ZYDIS_REGCLASS_GPR8;
+			case RegWidth::k16:  return reg_class == ZYDIS_REGCLASS_GPR16;
+			case RegWidth::k32:  return reg_class == ZYDIS_REGCLASS_GPR32;
+			case RegWidth::k64:  return reg_class == ZYDIS_REGCLASS_GPR64;
+			case RegWidth::kXmm: return reg_class == ZYDIS_REGCLASS_XMM;
+			case RegWidth::kYmm: return reg_class == ZYDIS_REGCLASS_YMM;
+			case RegWidth::kZmm: return reg_class == ZYDIS_REGCLASS_ZMM;
+			default: return false;
+			}
+		}
+		bool IsRipBase(ZydisRegister reg) {
+			return reg == ZYDIS_REGISTER_RIP || reg == ZYDIS_REGISTER_EIP;
+		}
+		const char* CaptureKindToString(CaptureKind kind) {
+			switch (kind) {
+			case CaptureKind::kRegister:  return "register";
+			case CaptureKind::kImmediate: return "immediate";
+			case CaptureKind::kAddress:   return "address";
+			case CaptureKind::kMemory:    return "memory";
+			default: return "unbound";
+			}
+		}
+	} // namespace
+
+	void MatchResult::Print() const {
+		printf("match at rva 0x%llX (va 0x%llX)\n",
+			(unsigned long long)rva_, (unsigned long long)Va());
+		for (size_t i = 0; i < captures_.size(); i++) {
+			const Capture& capture = captures_[i];
+			printf("  $v%zu %-10s ", i, CaptureKindToString(capture.kind));
+			switch (capture.kind) {
+			case CaptureKind::kRegister:
+				printf("%s\n", tables::RegisterToString(capture.reg).data());
+				break;
+			case CaptureKind::kImmediate:
+				printf("0x%llX (%lld)\n",
+					(unsigned long long)capture.value, (long long)capture.value);
+				break;
+			case CaptureKind::kAddress:
+				printf("rva 0x%llX, va 0x%llX\n",
+					(unsigned long long)capture.value,
+					(unsigned long long)(image_base_ + (uint64_t)capture.value));
+				break;
+			case CaptureKind::kMemory:
+				printf("[%s + %s*%u + 0x%llX]\n",
+					tables::RegisterToString(capture.mem_base).data(),
+					tables::RegisterToString(capture.mem_index).data(),
+					capture.mem_scale, (unsigned long long)capture.value);
+				break;
+			default:
+				printf("\n");
+				break;
+			}
+		}
+	}
+
+	Scanner::Scanner(const analyzer::PEAnalyzer& analyzer) : analyzer_(&analyzer) {
+		image_ = analyzer.Image();
+		size_ = analyzer.ImageSize();
+		starts_ = &analyzer.InstructionStarts();
+		ZydisDecoderInit(&decoder_, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+	}
+
+	void Scanner::SetCapture(std::string_view name, const Capture& capture) {
+		const uint64_t hash = detail::Fnv1a(name);
+		for (PreBound& bound : prebound_) {
+			if (bound.hash == hash) {
+				bound.capture = capture;
+				return;
+			}
+		}
+		prebound_.emplace_back(PreBound{ .hash = hash, .capture = capture });
+	}
+
+	void Scanner::Set(std::string_view name, ZydisRegister reg) {
+		Capture capture;
+		capture.kind = CaptureKind::kRegister;
+		capture.reg = reg;
+		SetCapture(name, capture);
+	}
+
+	void Scanner::SetAddress(std::string_view name, uint64_t rva) {
+		Capture capture;
+		capture.kind = CaptureKind::kAddress;
+		capture.value = (int64_t)rva;
+		capture.width = 64;
+		SetCapture(name, capture);
+	}
+
+	void Scanner::SetImmediate(std::string_view name, int64_t value, uint8_t width) {
+		Capture capture;
+		capture.kind = CaptureKind::kImmediate;
+		capture.value = value;
+		capture.width = width;
+		SetCapture(name, capture);
+	}
+
+	void Scanner::Set(std::string_view name, uint64_t value) {
+		Capture capture;
+		capture.kind = CaptureKind::kImmediate;
+		capture.value = (int64_t)value;
+		// the caller cannot know whether the operand will decode as an immediate
+		// or as a rip-relative address, so accept either
+		capture.numeric_any = true;
+		SetCapture(name, capture);
+	}
+
+	void Scanner::Unset(std::string_view name) {
+		const uint64_t hash = detail::Fnv1a(name);
+		for (size_t i = 0; i < prebound_.size(); i++) {
+			if (prebound_[i].hash == hash) {
+				prebound_.erase(prebound_.begin() + i);
+				return;
+			}
+		}
+	}
+
+	const Capture* Scanner::PreboundFor(PatternView pattern, uint8_t var_idx) const {
+		if (var_idx >= pattern.variable_hashes.size()) {
+			return nullptr;
+		}
+		const uint64_t hash = pattern.variable_hashes[var_idx];
+		for (const PreBound& bound : prebound_) {
+			if (bound.hash == hash) {
+				return &bound.capture;
+			}
+		}
+		return nullptr;
+	}
+
+	std::vector<Capture> Scanner::SeedCaptures(PatternView pattern) const {
+		std::vector<Capture> captures(pattern.variable_hashes.size());
+		for (const PreBound& bound : prebound_) {
+			const uint8_t index = pattern.IndexOf(bound.hash);
+			if (index != kNoVariable && index < captures.size()) {
+				captures[index] = bound.capture;
+			}
+		}
+		return captures;
+	}
+
+	bool Scanner::ValidatePrebound(PatternView pattern) const {
+		if (prebound_.empty()) {
+			return true;
+		}
+		bool ok = true;
+		const auto check = [&](uint8_t var_idx, bool wants_register, RegWidth width) {
+			if (var_idx == kNoVariable) {
+				return;
+			}
+			const Capture* seeded = PreboundFor(pattern, var_idx);
+			if (!seeded || seeded->kind == CaptureKind::kNone) {
+				return;
+			}
+			const bool is_register = seeded->kind == CaptureKind::kRegister;
+			if (wants_register != is_register) {
+				printf("pre-bound $v%u is a %s but the pattern uses it as a %s\n",
+					var_idx, CaptureKindToString(seeded->kind),
+					wants_register ? "register" : "value");
+				ok = false;
+				return;
+			}
+			// the type suffix is an assertion on a pre-bound value
+			if (is_register && !RegMatchesWidth(seeded->reg, width)) {
+				printf("pre-bound $v%u is %s, which is not %s\n", var_idx,
+					tables::RegisterToString(seeded->reg).data(),
+					RegWidthToString(width).data());
+				ok = false;
+			}
+		};
+		for (const Instruction& instruction : pattern.instructions) {
+			const MatchInstruction* match = std::get_if<MatchInstruction>(&instruction);
+			if (!match) {
+				continue;
+			}
+			for (uint8_t i = 0; i < match->operand_count; i++) {
+				const Operand& op = match->operands[i];
+				switch (op.type) {
+				case OperandType::kRegister:
+					if (op.reg.is_wildcard) {
+						check(op.reg.var_idx, true, op.reg.width);
+					}
+					break;
+				case OperandType::kImmediate:
+					if (op.imm.is_wildcard) {
+						check(op.imm.var_idx, false, RegWidth::kNone);
+					}
+					break;
+				case OperandType::kMemory:
+					if (op.mem.has_base && op.mem.base.is_wildcard) {
+						check(op.mem.base.var_idx, true, op.mem.base.width);
+					}
+					if (op.mem.has_index && op.mem.index.is_wildcard) {
+						check(op.mem.index.var_idx, true, op.mem.index.width);
+						if (op.mem.scale.is_wildcard) {
+							check(op.mem.scale.var_idx, false, RegWidth::kNone);
+						}
+					}
+					if (op.mem.has_disp && op.mem.disp.is_wildcard) {
+						check(op.mem.disp.var_idx, false, RegWidth::kNone);
+					}
+					break;
+				case OperandType::kWildcard:
+				default:
+					// a bare ? takes whatever the operand turns out to be
+					break;
+				}
+			}
+		}
+		return ok;
+	}
+
+	bool Scanner::Decode(uint64_t rva, ZydisDecodedInstruction& inst) const {
+		if (!image_ || rva >= size_) {
+			return false;
+		}
+		const size_t left = std::min<size_t>(size_ - rva, kMaxInstructionLength);
+		return ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(
+			&decoder_, nullptr, image_ + rva, left, &inst));
+	}
+
+	bool Scanner::DecodeFull(uint64_t rva, ZydisDecodedInstruction& inst,
+		ZydisDecodedOperand* operands) const {
+		if (!image_ || rva >= size_) {
+			return false;
+		}
+		const size_t left = std::min<size_t>(size_ - rva, kMaxInstructionLength);
+		return ZYAN_SUCCESS(ZydisDecoderDecodeFull(
+			&decoder_, image_ + rva, left, &inst, operands));
+	}
+
+	uint64_t Scanner::NextStart(uint64_t rva, uint8_t length) const {
+		const analyzer::Section* section = analyzer_->SectionOf(rva);
+		if (!section) {
+			return 0;
+		}
+		// starting at rva + length rather than rva + 1 keeps an overlapping
+		// instruction stream from being mistaken for the next instruction
+		for (uint64_t next = rva + length; next < section->End(); ++next) {
+			if ((*starts_)[next]) {
+				return next;
+			}
+		}
+		return 0;
+	}
+
+	Capture Scanner::CaptureFromOperand(const ZydisDecodedInstruction& inst,
+		const ZydisDecodedOperand& op, uint8_t imm_slot, uint64_t rva) const {
+		Capture capture;
+		switch (op.type) {
+		case ZYDIS_OPERAND_TYPE_REGISTER:
+			capture.kind = CaptureKind::kRegister;
+			capture.reg = op.reg.value;
+			break;
+		case ZYDIS_OPERAND_TYPE_IMMEDIATE:
+			capture.kind = CaptureKind::kImmediate;
+			capture.value = (int64_t)op.imm.value.u;
+			capture.width = inst.raw.imm[imm_slot].size;
+			if (op.imm.is_relative) {
+				// a branch target is an address, not a number
+				uint64_t target = 0;
+				if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&inst, &op, rva, &target))) {
+					capture.kind = CaptureKind::kAddress;
+					capture.value = (int64_t)target;
+					capture.width = 64;
+				}
+			}
+			break;
+		case ZYDIS_OPERAND_TYPE_MEMORY:
+			if (IsRipBase(op.mem.base)) {
+				// rip-relative operands resolve to an effective address; store the
+				// RVA, which is what the user actually wants out of [rip+X]
+				uint64_t target = 0;
+				if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&inst, &op, rva, &target))) {
+					capture.kind = CaptureKind::kAddress;
+					capture.value = (int64_t)target;
+					capture.width = 64;
+					break;
+				}
+			}
+			capture.kind = CaptureKind::kMemory;
+			capture.mem_segment = op.mem.segment;
+			capture.mem_base = op.mem.base;
+			capture.mem_index = op.mem.index;
+			capture.mem_scale = op.mem.scale;
+			capture.value = op.mem.disp.has_displacement ? op.mem.disp.value : 0;
+			capture.width = inst.raw.disp.size;
+			break;
+		default:
+			break;
+		}
+		return capture;
+	}
+
+	bool Scanner::BindOrCheck(uint8_t var_idx, const Capture& value, RegWidth width,
+		std::vector<Capture>& captures) const {
+		if (var_idx == kNoVariable) {
+			return true;
+		}
+		if (var_idx >= captures.size() || value.kind == CaptureKind::kNone) {
+			return false;
+		}
+		Capture& slot = captures[var_idx];
+		// a variable is immutable once bound: the first occurrence captures, every
+		// later one compares
+		if (slot.kind == CaptureKind::kNone) {
+			slot = value;
+			return true;
+		}
+		if (slot.kind != value.kind) {
+			// a pre-bound plain number satisfies both an immediate and a resolved
+			// address, since the caller cannot know which one the operand yields
+			const bool both_numeric =
+				(slot.kind == CaptureKind::kImmediate || slot.kind == CaptureKind::kAddress) &&
+				(value.kind == CaptureKind::kImmediate || value.kind == CaptureKind::kAddress);
+			if (!slot.numeric_any || !both_numeric) {
+				return false;
+			}
+			if (!ValueEquals(slot.value, value.value,
+				CommonWidth(slot.width, value.width))) {
+				return false;
+			}
+			// the value stands, but now that the operand has been seen the kind is
+			// known: adopt it so the capture reports as what it actually is. This
+			// is not a rebind - the value does not change - and a backtrack
+			// restores the snapshot anyway.
+			slot.kind = value.kind;
+			slot.width = value.width;
+			return true;
+		}
+		switch (slot.kind) {
+		case CaptureKind::kRegister:
+			// :* relaxes the width constraint on reuse, so rax and eax are the same
+			// register there and only there
+			return width == RegWidth::kAny
+				? SameEnclosingRegister(slot.reg, value.reg)
+				: slot.reg == value.reg;
+		case CaptureKind::kImmediate:
+			return ValueEquals(slot.value, value.value,
+				CommonWidth(slot.width, value.width));
+		case CaptureKind::kAddress:
+			return slot.value == value.value;
+		case CaptureKind::kMemory:
+			return slot.mem_segment == value.mem_segment &&
+				slot.mem_base == value.mem_base &&
+				slot.mem_index == value.mem_index &&
+				slot.mem_scale == value.mem_scale &&
+				ValueEquals(slot.value, value.value,
+					CommonWidth(slot.width, value.width));
+		default:
+			return false;
+		}
+	}
+
+	bool Scanner::MatchMemory(const MemOperand& pattern, const ZydisDecodedInstruction& inst,
+		const ZydisDecodedOperand& op, uint64_t rva, std::vector<Capture>& captures) const {
+		if (pattern.is_full_wildcard) {
+			return true;
+		}
+		if (pattern.has_segment && op.mem.segment != pattern.segment.reg) {
+			return false;
+		}
+		if (pattern.has_base) {
+			if (!pattern.base.is_wildcard) {
+				if (op.mem.base != pattern.base.reg) {
+					return false;
+				}
+			}
+			else {
+				if (op.mem.base == ZYDIS_REGISTER_NONE ||
+					!RegMatchesWidth(op.mem.base, pattern.base.width)) {
+					return false;
+				}
+				Capture capture;
+				capture.kind = CaptureKind::kRegister;
+				capture.reg = op.mem.base;
+				if (!BindOrCheck(pattern.base.var_idx, capture, pattern.base.width, captures)) {
+					return false;
+				}
+			}
+		}
+		else if (op.mem.base != ZYDIS_REGISTER_NONE) {
+			return false;
+		}
+		if (pattern.has_index) {
+			if (!pattern.index.is_wildcard) {
+				if (op.mem.index != pattern.index.reg) {
+					return false;
+				}
+			}
+			else {
+				if (op.mem.index == ZYDIS_REGISTER_NONE ||
+					!RegMatchesWidth(op.mem.index, pattern.index.width)) {
+					return false;
+				}
+				Capture capture;
+				capture.kind = CaptureKind::kRegister;
+				capture.reg = op.mem.index;
+				if (!BindOrCheck(pattern.index.var_idx, capture, pattern.index.width, captures)) {
+					return false;
+				}
+			}
+			if (!pattern.scale.is_wildcard) {
+				if ((int64_t)op.mem.scale != pattern.scale.value) {
+					return false;
+				}
+			}
+			else {
+				Capture capture;
+				capture.kind = CaptureKind::kImmediate;
+				capture.value = op.mem.scale;
+				capture.width = 8;
+				if (!BindOrCheck(pattern.scale.var_idx, capture, RegWidth::kNone, captures)) {
+					return false;
+				}
+			}
+		}
+		else if (op.mem.index != ZYDIS_REGISTER_NONE) {
+			return false;
+		}
+		const int64_t disp = op.mem.disp.has_displacement ? op.mem.disp.value : 0;
+		if (pattern.has_disp) {
+			if (!pattern.disp.is_wildcard) {
+				return ValueEquals(pattern.disp.value, disp, inst.raw.disp.size);
+			}
+			// [rip+$var] captures the effective address, not the raw displacement
+			Capture capture;
+			if (IsRipBase(op.mem.base)) {
+				capture = CaptureFromOperand(inst, op, 0, rva);
+			}
+			else {
+				capture.kind = CaptureKind::kImmediate;
+				capture.value = disp;
+				capture.width = inst.raw.disp.size;
+			}
+			return BindOrCheck(pattern.disp.var_idx, capture, RegWidth::kNone, captures);
+		}
+		// a pattern that writes no displacement only matches an instruction that
+		// encodes none, or encodes one that is zero
+		return disp == 0;
+	}
+
+	bool Scanner::MatchOperand(const Operand& pattern, const ZydisDecodedInstruction& inst,
+		const ZydisDecodedOperand& op, uint8_t imm_slot, uint64_t rva,
+		std::vector<Capture>& captures) const {
+		switch (pattern.type) {
+		case OperandType::kWildcard: {
+			// ? matches any operand at all; $var additionally captures whatever it is
+			if (pattern.var_idx == kNoVariable) {
+				return true;
+			}
+			const Capture capture = CaptureFromOperand(inst, op, imm_slot, rva);
+			return BindOrCheck(pattern.var_idx, capture, RegWidth::kNone, captures);
+		}
+		case OperandType::kRegister: {
+			if (op.type != ZYDIS_OPERAND_TYPE_REGISTER) {
+				return false;
+			}
+			if (!pattern.reg.is_wildcard) {
+				return op.reg.value == pattern.reg.reg;
+			}
+			if (!RegMatchesWidth(op.reg.value, pattern.reg.width)) {
+				return false;
+			}
+			Capture capture;
+			capture.kind = CaptureKind::kRegister;
+			capture.reg = op.reg.value;
+			return BindOrCheck(pattern.reg.var_idx, capture, pattern.reg.width, captures);
+		}
+		case OperandType::kImmediate: {
+			if (op.type != ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+				return false;
+			}
+			if (!pattern.imm.is_wildcard) {
+				return ValueEquals(pattern.imm.value, (int64_t)op.imm.value.u,
+					inst.raw.imm[imm_slot].size);
+			}
+			const Capture capture = CaptureFromOperand(inst, op, imm_slot, rva);
+			return BindOrCheck(pattern.imm.var_idx, capture, RegWidth::kNone, captures);
+		}
+		case OperandType::kMemory:
+			if (op.type != ZYDIS_OPERAND_TYPE_MEMORY) {
+				return false;
+			}
+			return MatchMemory(pattern.mem, inst, op, rva, captures);
+		default:
+			return false;
+		}
+	}
+
+	bool Scanner::MatchInstructionAt(const MatchInstruction& pattern, uint64_t rva,
+		std::vector<Capture>& captures, uint8_t& length) const {
+		ZydisDecodedInstruction inst{};
+		ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+		if (!DecodeFull(rva, inst, operands)) {
+			return false;
+		}
+		length = inst.length;
+		// prefixes are attributes, not mnemonics, so `movsb` matches `rep movsb`
+		if (inst.mnemonic != pattern.mnemonic) {
+			return false;
+		}
+		if (pattern.operand_count > inst.operand_count_visible) {
+			return false;
+		}
+		// the pattern has to cover every explicit operand; implicit ones (rax in
+		// `mul rcx`, the 1 in `shl rax, 1`) may be left out
+		for (uint8_t i = pattern.operand_count; i < inst.operand_count_visible; i++) {
+			if (operands[i].visibility == ZYDIS_OPERAND_VISIBILITY_EXPLICIT) {
+				return false;
+			}
+		}
+		// An instruction encodes at most two immediates (enter imm16, imm8), and
+		// Zydis reports their encoded widths in raw.imm[0] and raw.imm[1] in that
+		// order. Taking raw.imm[0] for both would compare the second one at the
+		// first one's width.
+		uint8_t imm_slot = 0;
+		for (uint8_t i = 0; i < pattern.operand_count; i++) {
+			if (!MatchOperand(pattern.operands[i], inst, operands[i], imm_slot, rva,
+				captures)) {
+				return false;
+			}
+			if (operands[i].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && imm_slot == 0) {
+				imm_slot = 1;
+			}
+		}
+		return true;
+	}
+
+	bool Scanner::MatchFrom(PatternView pattern, size_t index, uint64_t rva,
+		std::vector<Capture>& captures, uint64_t& next_rva) const {
+		if (index >= pattern.instructions.size()) {
+			next_rva = rva;
+			return true;
+		}
+		if (!rva) {
+			return false;
+		}
+		const Instruction& current = pattern.instructions[index];
+		if (const SkipRange* skip = std::get_if<SkipRange>(&current)) {
+			const uint64_t hi = std::min<uint64_t>(skip->hi, skip_limit_);
+			uint64_t cursor = rva;
+			for (uint64_t skipped = 0; ; ++skipped) {
+				if (skipped >= skip->lo) {
+					// every gap length is its own branch, so the captures have to be
+					// rolled back before the next one is tried
+					std::vector<Capture> snapshot = captures;
+					if (MatchFrom(pattern, index + 1, cursor, captures, next_rva)) {
+						return true;
+					}
+					captures = std::move(snapshot);
+				}
+				if (skipped >= hi || !cursor) {
+					return false;
+				}
+				ZydisDecodedInstruction inst{};
+				if (!Decode(cursor, inst)) {
+					return false;
+				}
+				cursor = NextStart(cursor, inst.length);
+				if (!cursor) {
+					return false;
+				}
+			}
+		}
+		const MatchInstruction& match = std::get<MatchInstruction>(current);
+		uint8_t length = 0;
+		if (!MatchInstructionAt(match, rva, captures, length)) {
+			return false;
+		}
+		if (index + 1 >= pattern.instructions.size()) {
+			next_rva = NextStart(rva, length);
+			return true;
+		}
+		return MatchFrom(pattern, index + 1, NextStart(rva, length), captures, next_rva);
+	}
+
+	bool Scanner::MatchAt(PatternView pattern, uint64_t rva,
+		const std::vector<Capture>& seed, MatchResult& out) const {
+		std::vector<Capture> captures = seed;
+		uint64_t next_rva = 0;
+		if (!MatchFrom(pattern, 0, rva, captures, next_rva)) {
+			return false;
+		}
+		out.rva_ = rva;
+		out.next_rva_ = next_rva;
+		out.image_base_ = analyzer_->ImageBase();
+		out.captures_ = std::move(captures);
+		out.hashes_.assign(pattern.variable_hashes.begin(), pattern.variable_hashes.end());
+		return true;
+	}
+
+	void Scanner::Collect(PatternView pattern, uint64_t start_rva, size_t limit,
+		std::vector<MatchResult>& out) const {
+		if (!analyzer_ || !analyzer_->IsAnalyzed() || pattern.instructions.empty()) {
+			return;
+		}
+		if (!ValidatePrebound(pattern)) {
+			return;
+		}
+		const std::vector<Capture> seed = SeedCaptures(pattern);
+		// when the pattern opens with a concrete mnemonic, most candidates can be
+		// thrown away after a decode without operands
+		ZydisMnemonic first = ZYDIS_MNEMONIC_INVALID;
+		if (const MatchInstruction* match =
+			std::get_if<MatchInstruction>(&pattern.instructions[0])) {
+			first = match->mnemonic;
+		}
+		for (const analyzer::Section& section : analyzer_->Sections()) {
+			if (!section.executable || section.End() <= start_rva) {
+				continue;
+			}
+			const uint64_t begin = std::max<uint64_t>(start_rva, section.va);
+			for (uint64_t rva = begin; rva < section.End(); ++rva) {
+				if (!(*starts_)[rva]) {
+					continue;
+				}
+				if (first != ZYDIS_MNEMONIC_INVALID) {
+					ZydisDecodedInstruction inst{};
+					if (!Decode(rva, inst) || inst.mnemonic != first) {
+						continue;
+					}
+				}
+				MatchResult result;
+				if (MatchAt(pattern, rva, seed, result)) {
+					out.push_back(std::move(result));
+					if (limit && out.size() >= limit) {
+						return;
+					}
+				}
+			}
+		}
+	}
+
+	std::optional<MatchResult> Scanner::Find(PatternView pattern, uint64_t start_rva) const {
+		std::vector<MatchResult> results;
+		Collect(pattern, start_rva, 1, results);
+		if (results.empty()) {
+			return std::nullopt;
+		}
+		return std::move(results.front());
+	}
+
+	std::vector<MatchResult> Scanner::FindAll(PatternView pattern, size_t limit) const {
+		std::vector<MatchResult> results;
+		Collect(pattern, 0, limit, results);
+		return results;
+	}
+} // namespace zigil
