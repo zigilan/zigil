@@ -625,75 +625,121 @@ namespace zigil {
 		return MatchFrom(pattern, index + 1, NextStart(rva, length), captures, next_rva);
 	}
 
-	bool Scanner::MatchAt(PatternView pattern, uint64_t rva,
-		const std::vector<Capture>& seed, MatchResult& out) const {
-		std::vector<Capture> captures = seed;
+	bool Scanner::MatchAt(PatternView pattern, uint64_t rva, const std::vector<Capture>& seed,
+		std::vector<Capture>& scratch, MatchResult& out) const {
+		// assign rather than construct: keeps the buffer's capacity between
+		// candidates, so a failed match costs no allocation at all
+		scratch.assign(seed.begin(), seed.end());
 		uint64_t next_rva = 0;
-		if (!MatchFrom(pattern, 0, rva, captures, next_rva)) {
+		if (!MatchFrom(pattern, 0, rva, scratch, next_rva)) {
 			return false;
 		}
 		out.rva_ = rva;
 		out.next_rva_ = next_rva;
 		out.image_base_ = analyzer_->ImageBase();
-		out.captures_ = std::move(captures);
+		out.captures_ = scratch;
 		out.hashes_.assign(pattern.variable_hashes.begin(), pattern.variable_hashes.end());
 		return true;
 	}
 
-	void Scanner::Collect(PatternView pattern, uint64_t start_rva, size_t limit,
-		std::vector<MatchResult>& out) const {
-		if (!analyzer_ || !analyzer_->IsAnalyzed() || pattern.instructions.empty()) {
+	void Scanner::Collect(std::span<const PatternView> patterns, uint64_t start_rva,
+		size_t limit_each, std::span<std::vector<MatchResult>> out) const {
+		if (!analyzer_ || !analyzer_->IsAnalyzed()) {
 			return;
 		}
-		if (!ValidatePrebound(pattern)) {
+
+		struct Candidate {
+			PatternView pattern;
+			std::vector<Capture> seed;
+			// when the pattern opens with a concrete mnemonic, most instructions
+			// can be thrown away after a decode without operands
+			ZydisMnemonic first;
+			std::vector<MatchResult>* out;
+			bool done;
+		};
+		std::vector<Candidate> active;
+		active.reserve(patterns.size());
+		for (size_t i = 0; i < patterns.size() && i < out.size(); i++) {
+			if (patterns[i].instructions.empty() || !ValidatePrebound(patterns[i])) {
+				continue;
+			}
+			ZydisMnemonic first = ZYDIS_MNEMONIC_INVALID;
+			if (const MatchInstruction* match =
+				std::get_if<MatchInstruction>(&patterns[i].instructions[0])) {
+				first = match->mnemonic;
+			}
+			active.push_back({ patterns[i], SeedCaptures(patterns[i]), first, &out[i], false });
+		}
+		if (active.empty()) {
 			return;
 		}
-		const std::vector<Capture> seed = SeedCaptures(pattern);
-		// when the pattern opens with a concrete mnemonic, most candidates can be
-		// thrown away after a decode without operands
-		ZydisMnemonic first = ZYDIS_MNEMONIC_INVALID;
-		if (const MatchInstruction* match =
-			std::get_if<MatchInstruction>(&pattern.instructions[0])) {
-			first = match->mnemonic;
-		}
+
+		std::vector<Capture> scratch;
+		size_t remaining = active.size();
 		for (const analyzer::Section& section : analyzer_->Sections()) {
 			if (!section.executable || section.End() <= start_rva) {
 				continue;
 			}
 			const uint64_t begin = std::max<uint64_t>(start_rva, section.va);
-			for (uint64_t rva = begin; rva < section.End(); ++rva) {
+			for (uint64_t rva = begin; rva < section.End() && remaining != 0; ++rva) {
 				if (!(*starts_)[rva]) {
 					continue;
 				}
-				if (first != ZYDIS_MNEMONIC_INVALID) {
-					ZydisDecodedInstruction inst{};
-					if (!Decode(rva, inst) || inst.mnemonic != first) {
+				// decoded at most once for the whole set, which is the point:
+				// this is what makes a second pattern nearly free
+				ZydisMnemonic mnemonic = ZYDIS_MNEMONIC_INVALID;
+				bool decoded = false;
+				for (Candidate& candidate : active) {
+					if (candidate.done) {
 						continue;
 					}
-				}
-				MatchResult result;
-				if (MatchAt(pattern, rva, seed, result)) {
-					out.push_back(std::move(result));
-					if (limit && out.size() >= limit) {
-						return;
+					if (candidate.first != ZYDIS_MNEMONIC_INVALID) {
+						if (!decoded) {
+							ZydisDecodedInstruction inst{};
+							mnemonic = Decode(rva, inst) ? inst.mnemonic : ZYDIS_MNEMONIC_INVALID;
+							decoded = true;
+						}
+						if (mnemonic != candidate.first) {
+							continue;
+						}
+					}
+					MatchResult result;
+					if (MatchAt(candidate.pattern, rva, candidate.seed, scratch, result)) {
+						candidate.out->push_back(std::move(result));
+						if (limit_each && candidate.out->size() >= limit_each) {
+							candidate.done = true;
+							remaining--;
+						}
 					}
 				}
+			}
+			if (remaining == 0) {
+				break;
 			}
 		}
 	}
 
+	std::vector<std::vector<MatchResult>> Scanner::FindAll(std::span<const PatternView> patterns,
+		size_t limit_each) const {
+		std::vector<std::vector<MatchResult>> results(patterns.size());
+		Collect(patterns, 0, limit_each, results);
+		return results;
+	}
+
 	std::optional<MatchResult> Scanner::Find(PatternView pattern, uint64_t start_rva) const {
-		std::vector<MatchResult> results;
-		Collect(pattern, start_rva, 1, results);
-		if (results.empty()) {
+		std::vector<MatchResult> results[1];
+		const PatternView one[] = { pattern };
+		Collect(one, start_rva, 1, results);
+		if (results[0].empty()) {
 			return std::nullopt;
 		}
-		return std::move(results.front());
+		return std::move(results[0].front());
 	}
 
 	std::vector<MatchResult> Scanner::FindAll(PatternView pattern, size_t limit) const {
-		std::vector<MatchResult> results;
-		Collect(pattern, 0, limit, results);
-		return results;
+		std::vector<MatchResult> results[1];
+		const PatternView one[] = { pattern };
+		Collect(one, 0, limit, results);
+		return std::move(results[0]);
 	}
 } // namespace zigil

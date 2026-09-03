@@ -135,6 +135,22 @@ namespace zigil {
 		std::vector<MatchResult> FindAll(PatternView pattern, size_t limit = 0) const;
 
 		/*
+		* Several patterns in a single pass. Result i holds the matches for
+		* patterns[i], in the same order FindAll would have produced them.
+		*
+		* A scan costs about the same whatever it looks for: the walk over the
+		* instruction index and the one decode per instruction dominate, not the
+		* pattern. So N separate FindAll calls pay that N times over for nothing,
+		* while this pays it once - measured on a 107M-instruction image at
+		* ~10 s per pass, whichever pattern was being looked for.
+		*
+		* Pre-bound variables are shared, which is what they already are: bind
+		* them under distinct names and each pattern picks up its own.
+		*/
+		std::vector<std::vector<MatchResult>> FindAll(std::span<const PatternView> patterns,
+			size_t limit_each = 0) const;
+
+		/*
 		* Pre-bound variables. A variable seeded here is enforced instead of
 		* captured when the pattern first reaches it, which is what turns a
 		* pattern into an xref search:
@@ -180,16 +196,22 @@ namespace zigil {
 		bool ValidatePrebound(PatternView pattern) const;
 
 		/* one pass over the instruction index; limit == 0 collects everything */
-		void Collect(PatternView pattern, uint64_t start_rva, size_t limit,
-			std::vector<MatchResult>& out) const;
+		void Collect(std::span<const PatternView> patterns, uint64_t start_rva, size_t limit_each,
+			std::span<std::vector<MatchResult>> out) const;
 		bool Decode(uint64_t rva, ZydisDecodedInstruction& inst) const;
 		bool DecodeFull(uint64_t rva, ZydisDecodedInstruction& inst,
 			ZydisDecodedOperand* operands) const;
 		/* first instruction start at or after rva + length, 0 when there is none */
 		uint64_t NextStart(uint64_t rva, uint8_t length) const;
 
-		bool MatchAt(PatternView pattern, uint64_t rva,
-			const std::vector<Capture>& seed, MatchResult& out) const;
+		/*
+		* `scratch` is the caller's working buffer for the capture set, reused
+		* across candidates. Copying the seed into a fresh vector per candidate
+		* is a heap allocation for every instruction that clears the mnemonic
+		* filter, and on a common opening mnemonic that is millions of them.
+		*/
+		bool MatchAt(PatternView pattern, uint64_t rva, const std::vector<Capture>& seed,
+			std::vector<Capture>& scratch, MatchResult& out) const;
 		bool MatchFrom(PatternView pattern, size_t index, uint64_t rva,
 			std::vector<Capture>& captures, uint64_t& next_rva) const;
 		bool MatchInstructionAt(const MatchInstruction& pattern, uint64_t rva,
