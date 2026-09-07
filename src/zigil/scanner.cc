@@ -1,6 +1,9 @@
 #include "zigil/scanner.hh"
 
 #include <algorithm>
+#include <atomic>
+#include <thread>
+#include <unordered_map>
 #include <variant>
 
 namespace zigil {
@@ -13,6 +16,24 @@ namespace zigil {
 		constexpr uint8_t kNoVariable = 0xFF;
 		/* an x86-64 instruction is never longer than this */
 		constexpr size_t kMaxInstructionLength = 16;
+		/* below this a range is not worth handing to a thread of its own */
+		constexpr uint64_t kMinScanChunk = 1ull << 20;
+
+		/*
+		* A limited scan stays on the calling thread. It stops as soon as it has
+		* enough matches, so which ones it keeps would otherwise depend on which
+		* worker reached its range first.
+		*/
+		unsigned WorkerCount(unsigned requested, size_t limit_each) {
+			if (limit_each) {
+				return 1;
+			}
+			if (requested) {
+				return requested;
+			}
+			const unsigned hardware = std::thread::hardware_concurrency();
+			return hardware ? hardware : 1;
+		}
 
 		constexpr uint64_t WidthMask(uint8_t bits) {
 			return (bits == 0 || bits >= 64) ? ~0ull : (1ull << bits) - 1;
@@ -539,12 +560,17 @@ namespace zigil {
 	}
 
 	bool Scanner::MatchInstructionAt(const MatchInstruction& pattern, uint64_t rva,
-		std::vector<Capture>& captures, uint8_t& length) const {
-		ZydisDecodedInstruction inst{};
-		ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
-		if (!DecodeFull(rva, inst, operands)) {
-			return false;
+		std::vector<Capture>& captures, uint8_t& length,
+		const DecodedInstruction* decoded) const {
+		DecodedInstruction own;
+		if (!decoded) {
+			if (!DecodeFull(rva, own.inst, own.operands)) {
+				return false;
+			}
+			decoded = &own;
 		}
+		const ZydisDecodedInstruction& inst = decoded->inst;
+		const ZydisDecodedOperand* operands = decoded->operands;
 		length = inst.length;
 		// prefixes are attributes, not mnemonics, so `movsb` matches `rep movsb`
 		if (inst.mnemonic != pattern.mnemonic) {
@@ -578,7 +604,8 @@ namespace zigil {
 	}
 
 	bool Scanner::MatchFrom(PatternView pattern, size_t index, uint64_t rva,
-		std::vector<Capture>& captures, uint64_t& next_rva) const {
+		std::vector<Capture>& captures, uint64_t& next_rva,
+		const DecodedInstruction* decoded) const {
 		if (index >= pattern.instructions.size()) {
 			next_rva = rva;
 			return true;
@@ -595,7 +622,7 @@ namespace zigil {
 					// every gap length is its own branch, so the captures have to be
 					// rolled back before the next one is tried
 					std::vector<Capture> snapshot = captures;
-					if (MatchFrom(pattern, index + 1, cursor, captures, next_rva)) {
+					if (MatchFrom(pattern, index + 1, cursor, captures, next_rva, nullptr)) {
 						return true;
 					}
 					captures = std::move(snapshot);
@@ -615,23 +642,24 @@ namespace zigil {
 		}
 		const MatchInstruction& match = std::get<MatchInstruction>(current);
 		uint8_t length = 0;
-		if (!MatchInstructionAt(match, rva, captures, length)) {
+		if (!MatchInstructionAt(match, rva, captures, length, decoded)) {
 			return false;
 		}
 		if (index + 1 >= pattern.instructions.size()) {
 			next_rva = NextStart(rva, length);
 			return true;
 		}
-		return MatchFrom(pattern, index + 1, NextStart(rva, length), captures, next_rva);
+		return MatchFrom(pattern, index + 1, NextStart(rva, length), captures, next_rva, nullptr);
 	}
 
 	bool Scanner::MatchAt(PatternView pattern, uint64_t rva, const std::vector<Capture>& seed,
-		std::vector<Capture>& scratch, MatchResult& out) const {
+		std::vector<Capture>& scratch, const DecodedInstruction* decoded,
+		MatchResult& out) const {
 		// assign rather than construct: keeps the buffer's capacity between
 		// candidates, so a failed match costs no allocation at all
 		scratch.assign(seed.begin(), seed.end());
 		uint64_t next_rva = 0;
-		if (!MatchFrom(pattern, 0, rva, scratch, next_rva)) {
+		if (!MatchFrom(pattern, 0, rva, scratch, next_rva, decoded)) {
 			return false;
 		}
 		out.rva_ = rva;
@@ -642,79 +670,148 @@ namespace zigil {
 		return true;
 	}
 
+	void Scanner::ScanRange(const ScanSet& set, uint64_t begin, uint64_t end, size_t limit_each,
+		ScanState& state, std::span<std::vector<MatchResult>> out) const {
+		auto try_candidate = [&](size_t index, uint64_t rva, const DecodedInstruction* decoded) {
+			if (state.done[index]) {
+				return;
+			}
+			const ScanSet::Candidate& candidate = set.candidates[index];
+			MatchResult result;
+			if (!MatchAt(candidate.pattern, rva, candidate.seed, state.scratch, decoded, result)) {
+				return;
+			}
+			out[index].push_back(std::move(result));
+			if (limit_each && out[index].size() >= limit_each) {
+				state.done[index] = true;
+				state.remaining--;
+			}
+		};
+		for (uint64_t rva = begin; rva < end && state.remaining != 0; ++rva) {
+			if (!(*starts_)[rva]) {
+				continue;
+			}
+			ZydisDecodedInstruction header{};
+			// header only, no operands: this is the shared walk, and it is what
+			// makes a pattern that opens on a rare mnemonic nearly free
+			if (!set.by_mnemonic.empty() && Decode(rva, header)) {
+				const auto bucket = set.by_mnemonic.find(header.mnemonic);
+				if (bucket != set.by_mnemonic.end()) {
+					/*
+					* Decoded with operands once for the whole bucket. Each candidate
+					* used to run this same decode itself before it could reject on
+					* an operand, which on a common opening mnemonic - a mov is a
+					* quarter of the image - was most of what a pass cost.
+					*/
+					DecodedInstruction decoded;
+					if (DecodeFull(rva, decoded.inst, decoded.operands)) {
+						for (const size_t index : bucket->second) {
+							try_candidate(index, rva, &decoded);
+						}
+					}
+				}
+			}
+			for (const size_t index : set.anywhere) {
+				try_candidate(index, rva, nullptr);
+			}
+		}
+	}
+
 	void Scanner::Collect(std::span<const PatternView> patterns, uint64_t start_rva,
 		size_t limit_each, std::span<std::vector<MatchResult>> out) const {
 		if (!analyzer_ || !analyzer_->IsAnalyzed()) {
 			return;
 		}
 
-		struct Candidate {
-			PatternView pattern;
-			std::vector<Capture> seed;
-			// when the pattern opens with a concrete mnemonic, most instructions
-			// can be thrown away after a decode without operands
-			ZydisMnemonic first;
-			std::vector<MatchResult>* out;
-			bool done;
-		};
-		std::vector<Candidate> active;
-		active.reserve(patterns.size());
+		ScanSet set;
+		set.candidates.reserve(patterns.size());
 		for (size_t i = 0; i < patterns.size() && i < out.size(); i++) {
 			if (patterns[i].instructions.empty() || !ValidatePrebound(patterns[i])) {
 				continue;
 			}
-			ZydisMnemonic first = ZYDIS_MNEMONIC_INVALID;
+			const size_t index = set.candidates.size();
+			set.candidates.push_back({ patterns[i], SeedCaptures(patterns[i]), i });
+			// the parser rejects an unknown mnemonic, so a MatchInstruction always
+			// carries a concrete one and every candidate lands in exactly one of
+			// these two
 			if (const MatchInstruction* match =
 				std::get_if<MatchInstruction>(&patterns[i].instructions[0])) {
-				first = match->mnemonic;
+				set.by_mnemonic[match->mnemonic].push_back(index);
 			}
-			active.push_back({ patterns[i], SeedCaptures(patterns[i]), first, &out[i], false });
+			else {
+				set.anywhere.push_back(index);
+			}
 		}
-		if (active.empty()) {
+		if (set.candidates.empty()) {
 			return;
 		}
 
-		std::vector<Capture> scratch;
-		size_t remaining = active.size();
+		// the ranges a pass covers, in the order one pass over the image would
+		// have reached them; the merge below relies on that order
+		std::vector<std::pair<uint64_t, uint64_t>> ranges;
+		const unsigned workers = WorkerCount(threads_, limit_each);
 		for (const analyzer::Section& section : analyzer_->Sections()) {
 			if (!section.executable || section.End() <= start_rva) {
 				continue;
 			}
 			const uint64_t begin = std::max<uint64_t>(start_rva, section.va);
-			for (uint64_t rva = begin; rva < section.End() && remaining != 0; ++rva) {
-				if (!(*starts_)[rva]) {
-					continue;
-				}
-				// decoded at most once for the whole set, which is the point:
-				// this is what makes a second pattern nearly free
-				ZydisMnemonic mnemonic = ZYDIS_MNEMONIC_INVALID;
-				bool decoded = false;
-				for (Candidate& candidate : active) {
-					if (candidate.done) {
-						continue;
-					}
-					if (candidate.first != ZYDIS_MNEMONIC_INVALID) {
-						if (!decoded) {
-							ZydisDecodedInstruction inst{};
-							mnemonic = Decode(rva, inst) ? inst.mnemonic : ZYDIS_MNEMONIC_INVALID;
-							decoded = true;
-						}
-						if (mnemonic != candidate.first) {
-							continue;
-						}
-					}
-					MatchResult result;
-					if (MatchAt(candidate.pattern, rva, candidate.seed, scratch, result)) {
-						candidate.out->push_back(std::move(result));
-						if (limit_each && candidate.out->size() >= limit_each) {
-							candidate.done = true;
-							remaining--;
-						}
-					}
-				}
+			// several chunks per worker, because instruction density varies enough
+			// across a section that one chunk each would leave threads idle
+			const uint64_t span = section.End() - begin;
+			const uint64_t chunk =
+				std::max<uint64_t>(kMinScanChunk, span / std::max(1u, workers * 4));
+			for (uint64_t at = begin; at < section.End(); at += chunk) {
+				ranges.emplace_back(at, std::min<uint64_t>(at + chunk, section.End()));
 			}
-			if (remaining == 0) {
-				break;
+		}
+		if (ranges.empty()) {
+			return;
+		}
+
+		// indexed by range, then by candidate; merged into `out` in range order,
+		// so the result is the same whoever scanned which range
+		std::vector<std::vector<std::vector<MatchResult>>> collected(ranges.size());
+		auto run = [&](size_t range, ScanState& state) {
+			collected[range].resize(set.candidates.size());
+			ScanRange(set, ranges[range].first, ranges[range].second, limit_each, state,
+				collected[range]);
+		};
+
+		if (workers <= 1) {
+			ScanState state{ std::vector<bool>(set.candidates.size(), false),
+				set.candidates.size(), {} };
+			for (size_t range = 0; range < ranges.size() && state.remaining != 0; range++) {
+				run(range, state);
+			}
+		}
+		else {
+			std::atomic<size_t> next{ 0 };
+			std::vector<std::thread> pool;
+			pool.reserve(workers - 1);
+			auto worker = [&] {
+				// limit_each is 0 on this path, so `done` never trips and a worker
+				// covers whatever ranges are left when it asks
+				ScanState state{ std::vector<bool>(set.candidates.size(), false),
+					set.candidates.size(), {} };
+				for (size_t range = next.fetch_add(1); range < ranges.size();
+					range = next.fetch_add(1)) {
+					run(range, state);
+				}
+			};
+			for (unsigned i = 1; i < workers; i++) {
+				pool.emplace_back(worker);
+			}
+			worker();
+			for (std::thread& thread : pool) {
+				thread.join();
+			}
+		}
+
+		for (std::vector<std::vector<MatchResult>>& ranged : collected) {
+			for (size_t index = 0; index < ranged.size(); index++) {
+				std::vector<MatchResult>& target = out[set.candidates[index].out_index];
+				target.insert(target.end(), std::make_move_iterator(ranged[index].begin()),
+					std::make_move_iterator(ranged[index].end()));
 			}
 		}
 	}

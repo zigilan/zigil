@@ -8,6 +8,7 @@
 
 #include <optional>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 namespace zigil {
@@ -138,11 +139,12 @@ namespace zigil {
 		* Several patterns in a single pass. Result i holds the matches for
 		* patterns[i], in the same order FindAll would have produced them.
 		*
-		* A scan costs about the same whatever it looks for: the walk over the
-		* instruction index and the one decode per instruction dominate, not the
-		* pattern. So N separate FindAll calls pay that N times over for nothing,
-		* while this pays it once - measured on a 107M-instruction image at
-		* ~10 s per pass, whichever pattern was being looked for.
+		* The walk over the instruction index is shared, so N separate FindAll
+		* calls pay for it N times over while this pays once. What a second
+		* pattern adds on top of that is decided by how common the mnemonic it
+		* opens on is: every candidate opening on the same mnemonic shares one
+		* full decode of each address they all reach, and one that opens on a
+		* rare mnemonic barely enters the matcher at all.
 		*
 		* Pre-bound variables are shared, which is what they already are: bind
 		* them under distinct names and each pattern picks up its own.
@@ -182,10 +184,34 @@ namespace zigil {
 		void SetSkipLimit(uint32_t limit) { skip_limit_ = limit; }
 		uint32_t SkipLimit() const { return skip_limit_; }
 
+		/*
+		* Worker threads a scan may use; 0 means one per hardware thread and 1
+		* keeps the scan on the calling thread. The split is over ranges of
+		* instruction starts and the results are merged in address order, so the
+		* thread count changes nothing about what a scan returns.
+		*
+		* A limited scan (Find, or FindAll with a limit) stays single threaded:
+		* it stops early, and a thread cannot know what the others have already
+		* found without making the result depend on who got there first.
+		*/
+		void SetThreadCount(unsigned threads) { threads_ = threads; }
+		unsigned ThreadCount() const { return threads_; }
+
 	private:
 		struct PreBound {
 			uint64_t hash;
 			Capture capture;
+		};
+		/*
+		* One address decoded with its operands, so the candidates that open on
+		* the same mnemonic can share it. Without this each of them re-runs a
+		* full ZydisDecoderDecodeFull of the same address before it can reject on
+		* an operand, and on a common opening mnemonic - a mov is a quarter of
+		* the image - those repeated decodes are most of what a pass costs.
+		*/
+		struct DecodedInstruction {
+			ZydisDecodedInstruction inst;
+			ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
 		};
 
 		void SetCapture(std::string_view name, const Capture& capture);
@@ -195,9 +221,43 @@ namespace zigil {
 		/* reports type conflicts between the pre-bound values and the pattern */
 		bool ValidatePrebound(PatternView pattern) const;
 
+		/*
+		* The candidates of one scan in the form the inner loop wants them:
+		* immutable for the whole pass, and bucketed by the mnemonic each pattern
+		* opens on. Shared by every worker thread, which is why nothing in here
+		* is written once a scan has started.
+		*/
+		struct ScanSet {
+			struct Candidate {
+				PatternView pattern;
+				std::vector<Capture> seed;
+				/* which entry of Collect's `out` this candidate's matches go to */
+				size_t out_index;
+			};
+			std::vector<Candidate> candidates;
+			std::unordered_map<ZydisMnemonic, std::vector<size_t>> by_mnemonic;
+			/* patterns opening with a gap, which match from any instruction start */
+			std::vector<size_t> anywhere;
+		};
+		/* one worker's mutable state, carried across the ranges it covers */
+		struct ScanState {
+			std::vector<bool> done;
+			size_t remaining = 0;
+			std::vector<Capture> scratch;
+		};
+
 		/* one pass over the instruction index; limit == 0 collects everything */
 		void Collect(std::span<const PatternView> patterns, uint64_t start_rva, size_t limit_each,
 			std::span<std::vector<MatchResult>> out) const;
+		/*
+		* Every instruction start in [begin, end) matched against every candidate,
+		* appending to `out` indexed by candidate rather than by pattern. A match
+		* may run past `end` - the range partitions where a pattern may start, not
+		* what it may read - so the ranges together produce exactly what one pass
+		* over the whole image would have.
+		*/
+		void ScanRange(const ScanSet& set, uint64_t begin, uint64_t end, size_t limit_each,
+			ScanState& state, std::span<std::vector<MatchResult>> out) const;
 		bool Decode(uint64_t rva, ZydisDecodedInstruction& inst) const;
 		bool DecodeFull(uint64_t rva, ZydisDecodedInstruction& inst,
 			ZydisDecodedOperand* operands) const;
@@ -209,13 +269,20 @@ namespace zigil {
 		* across candidates. Copying the seed into a fresh vector per candidate
 		* is a heap allocation for every instruction that clears the mnemonic
 		* filter, and on a common opening mnemonic that is millions of them.
+		*
+		* `decoded` is the instruction at `rva` already decoded by the caller, or
+		* null to decode it here. It only ever describes the pattern's first
+		* instruction, so it is not forwarded past index 0.
 		*/
 		bool MatchAt(PatternView pattern, uint64_t rva, const std::vector<Capture>& seed,
-			std::vector<Capture>& scratch, MatchResult& out) const;
+			std::vector<Capture>& scratch, const DecodedInstruction* decoded,
+			MatchResult& out) const;
 		bool MatchFrom(PatternView pattern, size_t index, uint64_t rva,
-			std::vector<Capture>& captures, uint64_t& next_rva) const;
+			std::vector<Capture>& captures, uint64_t& next_rva,
+			const DecodedInstruction* decoded) const;
 		bool MatchInstructionAt(const MatchInstruction& pattern, uint64_t rva,
-			std::vector<Capture>& captures, uint8_t& length) const;
+			std::vector<Capture>& captures, uint8_t& length,
+			const DecodedInstruction* decoded) const;
 		bool MatchOperand(const Operand& pattern, const ZydisDecodedInstruction& inst,
 			const ZydisDecodedOperand& op, uint8_t imm_slot, uint64_t rva,
 			std::vector<Capture>& captures) const;
@@ -233,6 +300,7 @@ namespace zigil {
 		const std::vector<bool>* starts_ = nullptr;
 		ZydisDecoder decoder_{};
 		uint32_t skip_limit_ = 256;
+		unsigned threads_ = 0;
 		std::vector<PreBound> prebound_;
 	};
 } // namespace zigil

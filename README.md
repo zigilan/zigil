@@ -485,6 +485,17 @@ Scanning is a separate pass over the instructions the analyzer found. A
 four-instruction pattern over shell32's 1.5M instructions takes about 0.4 s; the
 cost scales with the instruction count, not the file size.
 
+Two things decide what a pass costs beyond that walk. Patterns are bucketed by
+the mnemonic they open on, and each bucket decodes an address with its operands
+once for every candidate in it, so a second pattern on the same mnemonic is
+nearly free and one that opens on a rare mnemonic barely enters the matcher at
+all — **anchor a pattern on its rarest instruction, not on the one that happens
+to come first.** And an unlimited scan is split across ranges of instruction
+starts, one worker per hardware thread by default; `SetThreadCount` overrides
+that, and the results are merged in address order, so the thread count changes
+nothing about what a scan returns. On a 65M-instruction image a ten-pattern pass
+went from 23 s to 2 s across the two.
+
 ---
 
 ## Project layout
@@ -535,7 +546,8 @@ pre-bound variables, the CLI.
   than being recognised as tables.
 - Nothing rejects an immediate in a destination slot (`mov $off:imm, rcx`); that
   would need per-mnemonic operand knowledge.
-- Every file is analyzed from scratch, single threaded.
+- Every file is analyzed from scratch, and the analysis itself is single
+  threaded. Only the scan is split across threads.
 
 ## License
 
