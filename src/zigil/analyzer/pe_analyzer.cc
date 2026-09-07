@@ -161,6 +161,21 @@ namespace zigil::analyzer {
 		if (sections_.empty() || sections_.size() >= kNoSection) {
 			return false;
 		}
+		// Narrow what counts as code, if the caller asked. Done here, once,
+		// rather than at each of the six places that test the flag.
+		if (!opts_.code_sections.empty()) {
+			for (Section& section : sections_) {
+				if (!section.executable) {
+					continue;
+				}
+				const bool wanted =
+					std::find(opts_.code_sections.begin(), opts_.code_sections.end(),
+						section.name) != opts_.code_sections.end();
+				if (!wanted) {
+					section.executable = false;
+				}
+			}
+		}
 		page_section_.assign((size_ >> 12) + 1, kNoSection);
 		for (uint16_t i = 0; i < (uint16_t)sections_.size(); ++i) {
 			const Section& section = sections_[i];

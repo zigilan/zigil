@@ -39,6 +39,25 @@ namespace zigil::analyzer {
 		* a real branch points there.
 		*/
 		bool skip_writable_code = true;
+		/*
+		* Treat only these sections as code, by name. Empty -- the default --
+		* means every section the PE marks executable, which is what a general
+		* tool wants.
+		*
+		* The list is for a target whose executable range is mostly somebody
+		* else's. Rainbow Six ships 291 MB of .text next to 109 MB of .UBX1
+		* anti-tamper, and .UBX1 alone indexed 42.2 M instructions: 39% of the
+		* work, in code no pattern will ever anchor on. `Section::executable`
+		* is the single gate that recursive descent, every seeding stage, the
+		* gap sweep and the scanner's own walk all read, so clearing it for the
+		* rest removes them from all of it at once.
+		*
+		* Be deliberate about it. A pattern whose code lives in a section left
+		* out does not match less well, it does not match at all, and nothing
+		* says so -- which is why PrintReport and the section list still show
+		* what was excluded.
+		*/
+		std::vector<std::string> code_sections;
 		/* per-stage progress on stdout; errors are printed either way */
 		bool progress = true;
 	};
