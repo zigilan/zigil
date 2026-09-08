@@ -492,7 +492,27 @@ namespace zigil {
 		const int64_t disp = op.mem.disp.has_displacement ? op.mem.disp.value : 0;
 		if (pattern.has_disp) {
 			if (!pattern.disp.is_wildcard) {
-				return ValueEquals(pattern.disp.value, disp, inst.raw.disp.size);
+				/*
+				* Compared at full width, and deliberately NOT through
+				* ValueEquals, which is right for an immediate and wrong here.
+				*
+				* An immediate genuinely is the width it is encoded with, so -1
+				* and 0xFFFFFFFF are the same imm32 and matching either against
+				* the other is what a caller means. A displacement is not: the
+				* CPU sign extends it to 64 bits before adding, so the encoded
+				* width is an encoding detail and the value is always signed.
+				* Truncating to it makes every positive displacement below 0x100
+				* match its negative twin 0x100 lower - `[reg+0xB8]` matched
+				* every `[rbp-0x48]` in the image, and that is one of the most
+				* common stack accesses compiled code emits.
+				*
+				* It produced no wrong answer that looked wrong, which is why it
+				* survived: a struct-field hunt on Rainbow Six came back with
+				* 1258 matches for `mov r64, [r64+0xB8]`, and the noise was
+				* indistinguishable from a displacement that is simply common.
+				* Every match inspected was a -0x48.
+				*/
+				return pattern.disp.value == disp;
 			}
 			// [rip+$var] captures the effective address, not the raw displacement
 			Capture capture;
