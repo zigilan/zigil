@@ -2,12 +2,32 @@
 #define ZIGIL_LEXER_HH_
 
 #include <array>
+#include <cstdint>
 #include <cstdio>
 #include <format>
+#include <string>
 #include <string_view>
 #include <vector>
 
 namespace zigil {
+	namespace detail {
+		/*
+		* Where runtime parse errors go. Null - the default - prints them; the C
+		* API points it at a string for the duration of one parse to hand the
+		* first message back to its caller instead.
+		*/
+		inline thread_local std::string* error_sink = nullptr;
+
+		inline void ReportError(const std::string& message) {
+			if (!error_sink) {
+				printf("Error: %s\n", message.c_str());
+			}
+			else if (error_sink->empty()) {
+				*error_sink = message;
+			}
+		}
+	} // namespace detail
+
 	enum class TokenType : uint8_t {
 		kInvalid,
 		kNumber,
@@ -61,7 +81,7 @@ namespace zigil {
 		constexpr void PrintError(std::format_string<Args...> fmt, Args&&... args) const {
 			if (!std::is_constant_evaluated()) {
 				std::string msg = std::format(fmt, std::forward<Args>(args)...);
-				printf("Error: %s at Line %llu, Column %llu\n", msg.c_str(), line, column);
+				detail::ReportError(std::format("{} at Line {}, Column {}", msg, line, column));
 			}
 		}
 	};

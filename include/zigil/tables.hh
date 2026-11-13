@@ -3,6 +3,7 @@
 
 #include <Zydis/Zydis.h>
 
+#include <algorithm>
 #include <array>
 #include <string_view>
 
