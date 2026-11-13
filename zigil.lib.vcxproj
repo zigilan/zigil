@@ -93,6 +93,7 @@
   <ItemGroup>
     <ClCompile Include="src\zigil\scanner.cc" />
     <ClCompile Include="src\zigil\analyzer\pe_analyzer.cc" />
+    <ClCompile Include="src\zigil\zigil_c.cc" />
   </ItemGroup>
 
   <ItemGroup>
@@ -105,6 +106,7 @@
     <ClInclude Include="include\zigil\scanner.hh" />
     <ClInclude Include="include\zigil\tables.hh" />
     <ClInclude Include="include\zigil\zigil.hh" />
+    <ClInclude Include="include\zigil\zigil_c.h" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

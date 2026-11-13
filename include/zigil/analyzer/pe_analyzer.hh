@@ -10,7 +10,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <Windows.h>
+// lower case, so it also resolves on a case-sensitive file system (MinGW)
+#include <windows.h>
 
 namespace zigil::analyzer {
 	struct Section {

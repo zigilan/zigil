@@ -433,6 +433,30 @@ case where matching is position-dependent.
 
 From the CLI the same thing is `--set name=value`, repeatable.
 
+### From C and other languages
+
+`zigil/zigil_c.h` wraps the above in a plain C API for callers that are not
+C++ (Rust, through FFI, in [Zidro](https://github.com/zigilan/zidro)). Build
+`src/zigil/zigil_c.cc` along with the other two sources.
+
+```c
+char err[256];
+zigil_image* image = zigil_image_analyze(bytes, size, /*loaded=*/1, err, sizeof err);
+zigil_pattern* pattern = zigil_pattern_compile(text, strlen(text), err, sizeof err);
+zigil_binding bind = { "target", global_rva };   /* optional, like Scanner::Set */
+zigil_matches* m = zigil_find_all(image, pattern, 0, &bind, 1, err, sizeof err);
+for (size_t i = 0; i < zigil_matches_count(m); i++) {
+    zigil_capture reg;
+    zigil_match_capture(m, i, 0, &reg);           /* variable 0, see zigil_pattern_variable_name */
+    printf("%llx %s\n", zigil_match_rva(m, i), reg.reg);
+}
+zigil_matches_free(m); zigil_pattern_free(pattern); zigil_image_free(image);
+```
+
+Errors come back as text in the caller's buffer instead of being printed: a
+parse error carries its line and column. The image bytes are copied, so the
+buffer can go once `zigil_image_analyze` returns.
+
 ---
 
 ## How it works
@@ -505,6 +529,7 @@ zigil.vcxproj               the CLI and the tests
 zigil.lib.vcxproj           the same code as a static library, without either
 include/zigil/
   zigil.hh                  the _sig literal
+  zigil_c.h                 the C API
   lexer.hh                  Token, TokenType, Lexer (constexpr)
   parser.hh                 Parser, including the consteval pivot
   pattern.hh                Pattern / FixedPattern / PatternView, operand model
@@ -516,6 +541,7 @@ src/
   main.cc                   the CLI
   zigil/scanner.cc          the matcher
   zigil/analyzer/pe_analyzer.cc
+  zigil/zigil_c.cc          the C API
 tests/
   lexer_constexpr.cc        lexer level static_asserts
   parser_constexpr.cc       the parser test set
@@ -532,8 +558,8 @@ Working: lexer, parser, compile-time pivot, analyzer, matcher, captures,
 pre-bound variables, the CLI.
 
 - **x86-64 PE only.** No 32-bit, no ELF, no Mach-O.
-- **Windows and MSVC.** The code is not portable yet; it includes `Windows.h` for
-  the PE structures.
+- **Windows.** The code is not portable yet; it includes `windows.h` for the PE
+  structures. Developed with MSVC; it also builds with MinGW-w64 g++ 13.
 - Write+execute sections are skipped by the aggressive analyzer stages, because a
   packed section at rest does not disassemble into anything meaningful. Recursive
   descent still follows a real branch into one.

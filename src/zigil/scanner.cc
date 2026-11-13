@@ -1,7 +1,9 @@
 #include "zigil/scanner.hh"
+#include "zigil/lexer.hh"
 
 #include <algorithm>
 #include <atomic>
+#include <format>
 #include <thread>
 #include <unordered_map>
 #include <variant>
@@ -225,17 +227,16 @@ namespace zigil {
 			}
 			const bool is_register = seeded->kind == CaptureKind::kRegister;
 			if (wants_register != is_register) {
-				printf("pre-bound $v%u is a %s but the pattern uses it as a %s\n",
+				detail::ReportError(std::format("pre-bound $v{} is a {} but the pattern uses it as a {}",
 					var_idx, CaptureKindToString(seeded->kind),
-					wants_register ? "register" : "value");
+					wants_register ? "register" : "value"));
 				ok = false;
 				return;
 			}
 			// the type suffix is an assertion on a pre-bound value
 			if (is_register && !RegMatchesWidth(seeded->reg, width)) {
-				printf("pre-bound $v%u is %s, which is not %s\n", var_idx,
-					tables::RegisterToString(seeded->reg).data(),
-					RegWidthToString(width).data());
+				detail::ReportError(std::format("pre-bound $v{} is {}, which is not {}", var_idx,
+					tables::RegisterToString(seeded->reg), RegWidthToString(width)));
 				ok = false;
 			}
 		};
