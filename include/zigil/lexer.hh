@@ -2,6 +2,7 @@
 #define ZIGIL_LEXER_HH_
 
 #include <array>
+#include <cstdint>
 #include <cstdio>
 #include <format>
 #include <string>
